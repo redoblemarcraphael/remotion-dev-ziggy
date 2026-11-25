@@ -96,6 +96,8 @@ const makeAudioPlayer = (
 		getEffects: options?.getEffects ?? (() => []),
 		getEffectChainState: options?.getEffectChainState ?? (() => null),
 		maxCanvasSinkFrameSize: null,
+		pauseWhenBuffering: true,
+		catchUpOnStart: null,
 		onError,
 	});
 };
@@ -227,6 +229,8 @@ test('dispose should immediately unblock a pending playback catch-up', async () 
 		getEffects: () => [],
 		getEffectChainState: () => null,
 		maxCanvasSinkFrameSize: null,
+		pauseWhenBuffering: true,
+		catchUpOnStart: null,
 		onError: null,
 	});
 

@@ -61,6 +61,8 @@ export const videoIteratorManager = async ({
 	getEffects,
 	getEffectChainState,
 	maxCanvasSinkFrameSize,
+	getCatchesUp,
+	getIsPlaying,
 }: {
 	getIsDisposed: () => boolean;
 	videoTrack: InputVideoTrack;
@@ -79,6 +81,8 @@ export const videoIteratorManager = async ({
 		height: number,
 	) => EffectChainState | null;
 	maxCanvasSinkFrameSize: MaxCanvasSinkFrameSize | null;
+	getCatchesUp: () => boolean;
+	getIsPlaying: () => boolean;
 }) => {
 	let videoIteratorsCreated = 0;
 	let videoFrameIterator: VideoIterator | null = null;
@@ -285,6 +289,7 @@ export const videoIteratorManager = async ({
 		using delayHandle = delayPlaybackHandleIfNotPremounting();
 		currentDelayHandle = delayHandle;
 		currentSeek = timeToSeek;
+		const startedAt = performance.now();
 
 		let iterator: VideoIterator;
 		try {
@@ -328,6 +333,18 @@ export const videoIteratorManager = async ({
 			return;
 		}
 
+		// Playback started while the first frame was decoding. The clock has
+		// moved on, so this frame is stale: catch up from here instead.
+		if (getIsPlaying() && getCatchesUp()) {
+			catchingUp = true;
+			catchUpStart = timeToSeek;
+			catchUpRevision = null;
+			catchUpStartedAt = startedAt;
+			catchUpLastTime = timeToSeek;
+			currentSeek = null;
+			return;
+		}
+
 		if (nonce.isStale()) {
 			// During a paused scrub, every seek goes stale before its decode
 			// lands, so returning undrawn would discard every frame and freeze
@@ -351,6 +368,68 @@ export const videoIteratorManager = async ({
 		await drawFrame(iterator.initialFrame, timeToSeek);
 	};
 
+	// With `pauseWhenBuffering: false`, the player may not hold the clock. It
+	// cannot catch the clock by restarting at the current time on every tick:
+	// each restart decodes from the keyframe again while the clock moves on.
+	// Instead it starts at the playhead and keeps decoding forward across ticks,
+	// drawing nothing until it has a frame for the playhead.
+	let catchingUp = false;
+	let catchUpStart: number | null = null;
+	// The timeline seek revision of the playback run being caught up with. null
+	// until the first seek of a run that started during initialization.
+	let catchUpRevision: number | null = null;
+	let catchUpStartedAt = 0;
+	// The last requested time while catching up, to tell a jump back (a loop
+	// wrapping) from playback moving forward.
+	let catchUpLastTime: number | null = null;
+
+	const startCatchUp = async ({
+		time,
+		revision,
+	}: {
+		time: number;
+		revision: number | null;
+	}): Promise<void> => {
+		// The destroyed iterator releases the frame these still point to.
+		clearLastDrawnFrame();
+		videoFrameIterator?.destroy();
+		videoFrameIterator = null;
+		catchingUp = true;
+		catchUpStart = time;
+		catchUpRevision = revision;
+		catchUpStartedAt = performance.now();
+		catchUpLastTime = time;
+		currentSeek = time;
+		// Disarmed while the option is off. Switching it on while this decode runs
+		// arms it, so playback is delayed right away instead of after the decode.
+		using delayHandle = delayPlaybackHandleIfNotPremounting();
+		currentDelayHandle = delayHandle;
+
+		let iterator: VideoIterator;
+		try {
+			iterator = await createVideoIterator(time, prewarmedVideoIteratorCache);
+		} catch (error) {
+			if (!isCodecReclaimedError(error)) {
+				catchingUp = false;
+				currentSeek = null;
+				throw error;
+			}
+
+			prewarmedVideoIteratorCache.destroy();
+			iterator = await createVideoIterator(time, prewarmedVideoIteratorCache);
+		}
+
+		videoIteratorsCreated++;
+		// Callers run on the seek queue, so only disposal can intervene during the
+		// decode.
+		if (destroyed) {
+			iterator.destroy();
+			return;
+		}
+
+		videoFrameIterator = iterator;
+	};
+
 	const seek = async ({
 		newTime,
 		nonce,
@@ -358,6 +437,9 @@ export const videoIteratorManager = async ({
 		playbackRate,
 		isPlaying,
 		continuousPlayback,
+		seekRevision,
+		mappingChanged,
+		onMappingApplied,
 	}: {
 		newTime: number;
 		nonce: Nonce;
@@ -365,12 +447,114 @@ export const videoIteratorManager = async ({
 		playbackRate: number;
 		isPlaying: boolean;
 		continuousPlayback: boolean | null;
+		seekRevision: number | null;
+		mappingChanged: boolean;
+		// Called once a restart has picked up the current mapping, even if the
+		// seek is then superseded.
+		onMappingApplied: () => void;
 	}) => {
+		const catchesUp = isPlaying && getCatchesUp();
+		const restartIterator = (retryReclaimed: boolean) =>
+			catchesUp
+				? startCatchUp({time: newTime, revision: seekRevision})
+				: startVideoIterator(newTime, nonce, retryReclaimed);
+
+		if (!catchesUp) {
+			if (catchingUp) {
+				// Nothing was drawn while catching up, so this request must not be
+				// skipped as a repeat of currentSeek.
+				catchingUp = false;
+				currentSeek = null;
+			}
+		} else if (catchingUp) {
+			// Catching up belongs to the uninterrupted playback run that started it.
+			// An explicit seek, a mapping change or a jump back (a loop wrapping)
+			// starts again at the new time.
+			// Start-up catches up without a revision, and a seek made during start-up
+			// reaches the player only once it is ready. It shows up as a forward jump
+			// larger than the playback since start-up: restart there instead of
+			// adopting its revision.
+			const seekedDuringStartUp =
+				catchUpRevision === null &&
+				seekRevision !== null &&
+				catchUpStart !== null &&
+				newTime - catchUpStart >
+					((performance.now() - catchUpStartedAt) / 1000) *
+						Math.abs(playbackRate) +
+						1;
+			catchUpRevision ??= seekRevision;
+			if (
+				!videoFrameIterator ||
+				seekedDuringStartUp ||
+				mappingChanged ||
+				(seekRevision !== null && seekRevision !== catchUpRevision) ||
+				(catchUpLastTime !== null &&
+					roundTo4Digits(newTime) < roundTo4Digits(catchUpLastTime))
+			) {
+				const restart = restartIterator(true);
+				onMappingApplied();
+				await restart;
+				return;
+			}
+
+			catchUpLastTime = newTime;
+			const catchUpIterator = videoFrameIterator;
+			let waitedSince: number | null = null;
+			// Disarmed while the option is off, like the handle in startCatchUp().
+			let waitHandle: DelayPlaybackIfNotPremounting | null = null;
+			const result = await catchUpIterator
+				.tryToSatisfySeek(newTime, {
+					pendingFrameBehavior: 'wait',
+					onWait: () => {
+						waitedSince ??= performance.now();
+						waitHandle ??= delayPlaybackHandleIfNotPremounting();
+					},
+					shouldContinue: () =>
+						!nonce.isStale() && !catchUpIterator.isDestroyed(),
+				})
+				.catch((error: unknown) => {
+					if (isCodecReclaimedError(error)) {
+						return {type: 'decoder-reclaimed' as const};
+					}
+
+					throw error;
+				})
+				.finally(() => {
+					waitHandle?.unblock();
+				});
+			if (result.type === 'decoder-reclaimed') {
+				prewarmedVideoIteratorCache.destroy();
+				await restartIterator(false);
+				return;
+			}
+
+			// Superseded by a newer tick: the decoder keeps its place and continues
+			// from there.
+			if (nonce.isStale() || catchUpIterator.isDestroyed()) {
+				return;
+			}
+
+			// Caught up once the frame for the playhead arrives within a timeline
+			// frame. Only a few frames are decoded ahead, so at high source frame
+			// rates or playback rates even a decoder that keeps pace waits briefly
+			// on every tick. A longer wait means it is still behind.
+			if (
+				result.type === 'satisfied' &&
+				(waitedSince === null || performance.now() - waitedSince < 1000 / fps)
+			) {
+				catchingUp = false;
+				await drawFrame(result.frame, newTime);
+				currentSeek = newTime;
+			}
+
+			return;
+		}
+
 		if (!videoFrameIterator) {
 			// The previous iterator failed to start, or was discarded after its
 			// decoder was reclaimed by a seek that was then superseded.
 			if (!destroyed) {
-				await startVideoIterator(newTime, nonce, true);
+				await restartIterator(true);
 			}
 
 			return;
@@ -464,7 +648,7 @@ export const videoIteratorManager = async ({
 				currentDelayHandle = null;
 				// A single attempt: if the fresh decoder fails as well, the error
 				// propagates.
-				await startVideoIterator(newTime, nonce, false);
+				await restartIterator(false);
 				return;
 			}
 
@@ -482,7 +666,7 @@ export const videoIteratorManager = async ({
 			pending.handle?.unblock();
 			pending.handle = null;
 			currentDelayHandle = null;
-			await startVideoIterator(newTime, nonce, true);
+			await restartIterator(true);
 		} finally {
 			pending.handle?.unblock();
 			if (currentDelayHandle === pending.handle) {
@@ -499,6 +683,8 @@ export const videoIteratorManager = async ({
 		},
 		startVideoIterator: (timeToSeek: number, nonce: Nonce) =>
 			startVideoIterator(timeToSeek, nonce, true),
+		startCatchUp,
+		isCatchingUp: () => catchingUp,
 		getVideoIteratorsCreated: () => videoIteratorsCreated,
 		seek,
 		destroy: () => {

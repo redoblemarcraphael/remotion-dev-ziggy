@@ -78,6 +78,10 @@ export class MediaPlayer {
 	private lastRequestedTime = 0;
 	private lastSeekIntent: MediaSeekIntent = null;
 	private satisfiedSeekRevision: number | null = null;
+	// Set by a mapping change (intent 'discontinuity') until a seek that is not
+	// superseded has passed it to the iterators, so a newer tick that supersedes
+	// the queued discontinuity still carries it.
+	private pendingMappingChange = false;
 	private loop = false;
 	private fps: number;
 
@@ -104,6 +108,8 @@ export class MediaPlayer {
 	) => EffectChainState | null;
 
 	private maxCanvasSinkFrameSize: MaxCanvasSinkFrameSize | null;
+	private pauseWhenBuffering: boolean;
+	private catchUpOnStart: boolean;
 
 	private initializationPromise: Promise<MediaPlayerInitResult> | null = null;
 
@@ -139,6 +145,8 @@ export class MediaPlayer {
 		getEffects,
 		getEffectChainState,
 		maxCanvasSinkFrameSize,
+		pauseWhenBuffering,
+		catchUpOnStart,
 		onError,
 	}: {
 		canvas: HTMLCanvasElement | OffscreenCanvas | null;
@@ -170,6 +178,8 @@ export class MediaPlayer {
 			height: number,
 		) => EffectChainState | null;
 		maxCanvasSinkFrameSize: MaxCanvasSinkFrameSize | null;
+		pauseWhenBuffering: boolean;
+		catchUpOnStart: boolean | null;
 		onError: ((error: Error) => void) | null;
 	}) {
 		this.canvas = canvas ?? null;
@@ -185,10 +195,13 @@ export class MediaPlayer {
 		this.audioStreamIndex = audioStreamIndex;
 		this.fps = fps;
 		this.debugOverlay = debugOverlay;
+		this.pauseWhenBuffering = pauseWhenBuffering;
+		this.catchUpOnStart = catchUpOnStart ?? false;
 		this.premountAwareDelayPlayback = new PremountAwareDelayPlayback({
 			bufferState,
 			isPremounting,
 			isPostmounting,
+			pauseWhenBuffering,
 		});
 		this.sequenceDurationInFrames = durationInFrames;
 		this.nonceManager = makeNonceManager();
@@ -490,6 +503,11 @@ export class MediaPlayer {
 					getEffects: this.getEffects,
 					getEffectChainState: this.getEffectChainState,
 					maxCanvasSinkFrameSize: this.maxCanvasSinkFrameSize,
+					// Catching up moves forward; reverse playback keeps the normal path.
+					getCatchesUp: () =>
+						!this.pauseWhenBuffering &&
+						this.playbackRate * this.globalPlaybackRate > 0,
+					getIsPlaying: () => this.playing,
 				});
 				this.videoIteratorManager.setCanvasUpdateCallback(this.onCanvasUpdated);
 			}
@@ -530,7 +548,14 @@ export class MediaPlayer {
 							})
 						: Promise.resolve(),
 					this.videoIteratorManager
-						? this.videoIteratorManager.startVideoIterator(startTime, nonce)
+						? (this.playing || this.catchUpOnStart) &&
+							!this.pauseWhenBuffering &&
+							this.playbackRate * this.globalPlaybackRate > 0
+							? this.videoIteratorManager.startCatchUp({
+									time: startTime,
+									revision: null,
+								})
+							: this.videoIteratorManager.startVideoIterator(startTime, nonce)
 						: Promise.resolve(),
 				]);
 			} catch (error) {
@@ -604,6 +629,7 @@ export class MediaPlayer {
 		if (intent === 'discontinuity') {
 			// A mapping change may supersede a queued timeline request.
 			this.satisfiedSeekRevision = null;
+			this.pendingMappingChange = true;
 		}
 
 		await this.seekToWithQueue(newTime, time, intent);
@@ -650,6 +676,15 @@ export class MediaPlayer {
 							: intent !== 'discontinuity' &&
 								intent.playing &&
 								intent.revision === this.satisfiedSeekRevision,
+					seekRevision:
+						intent === null || intent === 'discontinuity'
+							? null
+							: intent.revision,
+					// seekTo() sets this for a discontinuity too.
+					mappingChanged: this.pendingMappingChange,
+					onMappingApplied: () => {
+						this.pendingMappingChange = false;
+					},
 				}),
 				this.audioIteratorManager?.seek({
 					newTime,
@@ -673,6 +708,10 @@ export class MediaPlayer {
 			// Superseded work must not consume an explicit seek boundary.
 			if (!nonce.isStale() && intent !== null && intent !== 'discontinuity') {
 				this.satisfiedSeekRevision = intent.revision;
+			}
+
+			if (!nonce.isStale()) {
+				this.pendingMappingChange = false;
 			}
 		} catch (error) {
 			if (this.isDisposalError()) {
@@ -707,6 +746,13 @@ export class MediaPlayer {
 
 		this.playing = false;
 		this.drawDebugOverlay();
+		// A player catching up has drawn nothing yet. Pausing usually keeps the
+		// same time, which issues no new seek, so request the current frame here.
+		if (this.videoIteratorManager?.isCatchingUp()) {
+			this.seekTo(this.lastRequestedTime, this.lastSeekIntent).catch((error) =>
+				this.reportTerminalError(error),
+			);
+		}
 	}
 
 	public setMuted(muted: boolean): void {
@@ -806,6 +852,11 @@ export class MediaPlayer {
 			this.audioIteratorManager?.destroyIterator();
 			await this.seekTo(unloopedTimeInSeconds, 'discontinuity');
 		}
+	}
+
+	public setPauseWhenBuffering(pauseWhenBuffering: boolean): void {
+		this.pauseWhenBuffering = pauseWhenBuffering;
+		this.premountAwareDelayPlayback.setPauseWhenBuffering(pauseWhenBuffering);
 	}
 
 	public setIsPremounting(isPremounting: boolean): void {
