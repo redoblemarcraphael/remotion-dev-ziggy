@@ -168,6 +168,115 @@ test('uses the initial volume before audio playback is ready', async () => {
 	}
 });
 
+// Muting, or a volume that reaches 0, used to destroy the audio iterator. The
+// next seek then had to wait for a new one to buffer, which stalled playback.
+test('keeps the audio iterator through mute and volume changes', async () => {
+	const sharedAudioContext = makeSharedAudioContext();
+	const player = makeAudioPlayer(sharedAudioContext);
+	try {
+		expect((await player.initialize(0, false, 1)).type).toBe('success');
+		await player.seekTo(0, null);
+		const manager = player.audioIteratorManager!;
+		const created = manager.getAudioIteratorsCreated();
+		expect(created).toBeGreaterThan(0);
+
+		player.setMuted(true);
+		await player.seekTo(0, null);
+		player.setMuted(false);
+		await player.seekTo(0, null);
+		player.setVolume(0);
+		await player.seekTo(0, null);
+		player.setVolume(1);
+		await player.seekTo(0, null);
+
+		expect(manager.getAudioIteratorsCreated()).toBe(created);
+	} finally {
+		await player.dispose();
+		await sharedAudioContext.audioContext.close();
+	}
+});
+
+test('a muted seek prepares audio without holding playback', async () => {
+	let holds = 0;
+	const bufferState = {
+		delayPlayback: () => {
+			holds++;
+			return {unblock: () => {}};
+		},
+	};
+	const sharedAudioContext = makeSharedAudioContext();
+	const player = makeAudioPlayer(sharedAudioContext, null, 'audio', {
+		canvas: null,
+		onVideoFrameCallback: null,
+		src: '/voice-note.m4a',
+		bufferState,
+	});
+	try {
+		expect((await player.initialize(0, false, 1)).type).toBe('success');
+		await player.seekTo(0, null);
+		const manager = player.audioIteratorManager!;
+		const created = manager.getAudioIteratorsCreated();
+		const heldWhileAudible = holds;
+		expect(heldWhileAudible).toBeGreaterThan(0);
+
+		player.setMuted(true);
+		await player.seekTo(5, null);
+		expect(manager.getAudioIteratorsCreated()).toBeGreaterThan(created);
+		expect(holds).toBe(heldWhileAudible);
+	} finally {
+		await player.dispose();
+		await sharedAudioContext.audioContext.close();
+	}
+});
+
+test('the startup hold follows mute while audio is still loading', async () => {
+	let activeBlocks = 0;
+	const bufferState = {
+		delayPlayback: () => {
+			activeBlocks++;
+			let unblocked = false;
+			return {
+				unblock: () => {
+					if (!unblocked) {
+						unblocked = true;
+						activeBlocks--;
+					}
+				},
+			};
+		},
+	};
+	const sharedAudioContext = makeSharedAudioContext();
+	const player = makeAudioPlayer(sharedAudioContext, null, 'audio', {
+		canvas: null,
+		onVideoFrameCallback: null,
+		src: '/voice-note.m4a',
+		bufferState,
+	});
+	try {
+		expect((await player.initialize(0, false, 1)).type).toBe('success');
+		await vi.waitFor(() => expect(activeBlocks).toBe(0));
+
+		// Muting releases a hold that an audible seek is still waiting on.
+		await player.seekTo(5, null);
+		expect(activeBlocks).toBe(1);
+		player.setMuted(true);
+		expect(activeBlocks).toBe(0);
+
+		// Becoming audible before the first audio arrives waits for it again.
+		player.setMuted(false);
+		expect(activeBlocks).toBe(1);
+		await vi.waitFor(() => expect(activeBlocks).toBe(0));
+
+		// Once the audio is ready, unmuting does not hold playback.
+		player.setMuted(true);
+		player.setMuted(false);
+		expect(activeBlocks).toBe(0);
+	} finally {
+		await player.dispose();
+		await sharedAudioContext.audioContext.close();
+	}
+});
+
 test('dispose should immediately unblock a pending playback catch-up', async () => {
 	let activeBlocks = 0;
 	let delayPlaybackCalled: () => void = () => {};
@@ -354,6 +463,33 @@ test.each(['audio', 'video'] as const)(
 		}
 	},
 );
+
+test('defers a failed audio read at volume 0 until the volume rises', async () => {
+	const onError = vi.fn();
+	const sharedAudioContext = makeSharedAudioContext();
+	const player = makeAudioPlayer(sharedAudioContext, onError);
+	const error = new TypeError('Failed to fetch');
+	const buffers = vi
+		.spyOn(AudioBufferSink.prototype, 'buffers')
+		.mockImplementation(
+			// eslint-disable-next-line require-yield
+			async function* () {
+				throw error;
+			},
+		);
+	try {
+		await player.initialize(0, false, 0);
+		await player.seekTo(1, null);
+		await vi.waitFor(() => expect(player.audioIteratorManager).toBeNull());
+		expect(onError).not.toHaveBeenCalled();
+		player.setVolume(1);
+		await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(error));
+	} finally {
+		buffers.mockRestore();
+		await player.dispose();
+		await sharedAudioContext.audioContext.close();
+	}
+});
 
 test('ignores pending seek failures after disposal and skips new seeks', async () => {
 	const onError = vi.fn();
@@ -561,6 +697,47 @@ test('draws muted video with unsupported audio and reports it on unmute', async 
 		await vi.waitFor(() => expect(errors).toHaveLength(1));
 		expect(errors[0].message).toContain('Cannot decode audio');
 		player.setMuted(false);
+		expect(errors).toHaveLength(1);
+	} finally {
+		await player.dispose();
+		await sharedAudioContext.audioContext.close();
+		support.mockRestore();
+	}
+});
+
+test('reports unsupported audio at volume 0 once the volume rises', async () => {
+	const support = vi
+		.spyOn(InputAudioTrack.prototype, 'canDecode')
+		.mockResolvedValue(false);
+	const errors: Error[] = [];
+	const sharedAudioContext = makeSharedAudioContext();
+	const player = makeAudioPlayer(
+		sharedAudioContext,
+		(error) => errors.push(error),
+		'video',
+		{
+			src: '/bigbuckbunny.mp4',
+			canvas: document.createElement('canvas'),
+			onVideoFrameCallback: null,
+		},
+	);
+	try {
+		expect((await player.initialize(0, false, 0)).type).toBe('success');
+		expect(errors).toHaveLength(0);
+		// Muted at a positive volume, then one render unmutes and sets volume 0.
+		// The mute effect runs before the volume effect; neither is audible.
+		player.setMuted(true);
+		player.setVolume(1);
+		await Promise.resolve();
+		player.setMuted(false);
+		player.setVolume(0);
+		await Promise.resolve();
+		expect(errors).toHaveLength(0);
+		player.setVolume(0.5);
+		await vi.waitFor(() => expect(errors).toHaveLength(1));
+		expect(errors[0].message).toContain('Cannot decode audio');
+		player.setVolume(1);
+		await Promise.resolve();
 		expect(errors).toHaveLength(1);
 	} finally {
 		await player.dispose();
